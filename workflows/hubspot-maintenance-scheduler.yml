@@ -1,0 +1,225 @@
+name: HubSpot Maintenance Scheduler
+
+# ─── Triggers ────────────────────────────────────────────────────────────────
+# Runs on the 3rd of every month at 2am AEST (16:00 UTC 2nd)
+# This is 1 week before the 10th — moves tickets to In Progress and fires automation
+on:
+  schedule:
+    - cron: '0 16 2 * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run only — list tickets, do not trigger workflows'
+        required: true
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      ticket_id:
+        description: 'Optional: run for a single HubSpot ticket ID only'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  schedule-maintenance:
+    name: Find Automated Tickets and Trigger Workflows
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. Query HubSpot for Automated tickets in Monthly WP Maintenance ──
+      - name: Fetch automated maintenance tickets from HubSpot
+        id: fetch_tickets
+        env:
+          HUBSPOT_API_TOKEN: ${{ secrets.HUBSPOT_API_TOKEN }}
+          HUBSPOT_PIPELINE_ID: ${{ secrets.HUBSPOT_PIPELINE_ID }}
+          HUBSPOT_STAGE_NEW: ${{ secrets.HUBSPOT_STAGE_NEW }}
+          SINGLE_TICKET_ID: ${{ github.event.inputs.ticket_id }}
+        run: |
+          # If a single ticket ID was provided, fetch just that one
+          if [ -n "$SINGLE_TICKET_ID" ]; then
+            echo "Fetching single ticket: $SINGLE_TICKET_ID"
+            RESPONSE=$(curl -sf \
+              -H "Authorization: Bearer $HUBSPOT_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.hubapi.com/crm/v3/objects/tickets/$SINGLE_TICKET_ID?properties=subject,hs_pipeline,hs_pipeline_stage,ai_automated,wp_install_name,github_repo,wp_dev_url,wp_staging_url,wp_engine_prod_url,ticket_objective")
+            echo "$RESPONSE" | jq '[{
+              id: .id,
+              subject: .properties.subject,
+              ai_automated: .properties.ai_automated,
+              wp_install_name: .properties.wp_install_name,
+              github_repo: .properties.github_repo,
+              wp_dev_url: .properties.wp_dev_url,
+              wp_staging_url: .properties.wp_staging_url,
+              wp_prod_url: .properties.wp_engine_prod_url,
+              ticket_objective: .properties.ticket_objective
+            }]' > /tmp/tickets.json
+          else
+            # Search for tickets in Monthly WP Maintenance pipeline
+            # with ai_automated = Yes and stage = New
+            SEARCH_PAYLOAD=$(cat <<'PAYLOAD'
+          {
+            "filterGroups": [
+              {
+                "filters": [
+                  {"propertyName": "hs_pipeline",    "operator": "EQ", "value": "PIPELINE_ID_PLACEHOLDER"},
+                  {"propertyName": "ai_automated",   "operator": "EQ", "value": "Yes"},
+                  {"propertyName": "hs_pipeline_stage", "operator": "IN", "values": ["STAGE_NEW_PLACEHOLDER"]}
+                ]
+              }
+            ],
+            "properties": [
+              "subject","hs_pipeline","hs_pipeline_stage","ai_automated",
+              "wp_install_name","github_repo","wp_dev_url","wp_staging_url",
+              "wp_engine_prod_url","ticket_objective"
+            ],
+            "limit": 100
+          }
+          PAYLOAD
+          )
+            # Inject real pipeline/stage IDs
+            SEARCH_PAYLOAD=$(echo "$SEARCH_PAYLOAD" \
+              | sed "s/PIPELINE_ID_PLACEHOLDER/$HUBSPOT_PIPELINE_ID/" \
+              | sed "s/STAGE_NEW_PLACEHOLDER/$HUBSPOT_STAGE_NEW/")
+
+            RESPONSE=$(curl -sf \
+              -X POST \
+              -H "Authorization: Bearer $HUBSPOT_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$SEARCH_PAYLOAD" \
+              "https://api.hubapi.com/crm/v3/objects/tickets/search")
+
+            echo "$RESPONSE" | jq '[.results[] | {
+              id: .id,
+              subject: .properties.subject,
+              ai_automated: .properties.ai_automated,
+              wp_install_name: .properties.wp_install_name,
+              github_repo: .properties.github_repo,
+              wp_dev_url: .properties.wp_dev_url,
+              wp_staging_url: .properties.wp_staging_url,
+              wp_prod_url: .properties.wp_engine_prod_url,
+              ticket_objective: .properties.ticket_objective
+            }]' > /tmp/tickets.json
+          fi
+
+          TICKET_COUNT=$(jq length /tmp/tickets.json)
+          echo "Found $TICKET_COUNT automated ticket(s)"
+          echo "ticket_count=$TICKET_COUNT" >> $GITHUB_OUTPUT
+          cat /tmp/tickets.json
+
+      # ── 2. Validate each ticket has required fields ────────────────────────
+      - name: Validate ticket data
+        id: validate
+        run: |
+          VALID=0
+          INVALID=0
+
+          jq -c '.[]' /tmp/tickets.json | while read ticket; do
+            ID=$(echo "$ticket" | jq -r '.id')
+            REPO=$(echo "$ticket" | jq -r '.github_repo // ""')
+            INSTALL=$(echo "$ticket" | jq -r '.wp_install_name // ""')
+            SUBJECT=$(echo "$ticket" | jq -r '.subject // ""')
+
+            if [ -z "$REPO" ] || [ -z "$INSTALL" ]; then
+              echo "⚠️  SKIP ticket $ID ($SUBJECT) — missing github_repo or wp_install_name"
+            else
+              echo "✅  VALID ticket $ID ($SUBJECT) → repo=$REPO install=$INSTALL"
+            fi
+          done
+
+      # ── 3. For each valid ticket: move to In Progress + trigger workflow ───
+      - name: Trigger maintenance workflows
+        if: github.event.inputs.dry_run != 'true'
+        env:
+          HUBSPOT_API_TOKEN: ${{ secrets.HUBSPOT_API_TOKEN }}
+          HUBSPOT_STAGE_IN_PROGRESS: ${{ secrets.HUBSPOT_STAGE_IN_PROGRESS }}
+          GH_TOKEN: ${{ secrets.ORG_WORKFLOW_TOKEN }}
+          GH_ORG: Wordie-Digital
+        run: |
+          jq -c '.[]' /tmp/tickets.json | while read ticket; do
+            TICKET_ID=$(echo "$ticket" | jq -r '.id')
+            REPO=$(echo "$ticket" | jq -r '.github_repo // ""')
+            INSTALL=$(echo "$ticket" | jq -r '.wp_install_name // ""')
+            DEV_URL=$(echo "$ticket" | jq -r '.wp_dev_url // ""')
+            STAGING_URL=$(echo "$ticket" | jq -r '.wp_staging_url // ""')
+            PROD_URL=$(echo "$ticket" | jq -r '.wp_prod_url // ""')
+            OBJECTIVE=$(echo "$ticket" | jq -r '.ticket_objective // "Monthly plugin and theme updates"')
+
+            if [ -z "$REPO" ] || [ -z "$INSTALL" ]; then
+              echo "SKIP: ticket $TICKET_ID — no repo or install name"
+              continue
+            fi
+
+            echo "▶ Triggering maintenance for $REPO (ticket $TICKET_ID)"
+
+            # 3a. Move HubSpot ticket → In Progress
+            curl -sf \
+              -X PATCH \
+              -H "Authorization: Bearer $HUBSPOT_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"properties\": {\"hs_pipeline_stage\": \"$HUBSPOT_STAGE_IN_PROGRESS\", \"automation_run_date\": \"$(date -u +%s)000\"}}" \
+              "https://api.hubapi.com/crm/v3/objects/tickets/$TICKET_ID" \
+              && echo "  ✅ HubSpot ticket $TICKET_ID → In Progress" \
+              || echo "  ⚠️  Failed to update HubSpot ticket $TICKET_ID"
+
+            # 3b. Add a HubSpot note on the ticket
+            NOTE_BODY="🤖 Automation started by GitHub Actions on $(date -u '+%Y-%m-%d %H:%M UTC').
+          Repo: Wordie-Digital/$REPO
+          Install: $INSTALL
+          Objective: $OBJECTIVE"
+
+            curl -sf \
+              -X POST \
+              -H "Authorization: Bearer $HUBSPOT_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"properties\": {
+                  \"hs_note_body\": $(echo "$NOTE_BODY" | jq -Rs .),
+                  \"hs_timestamp\": \"$(date -u +%s)000\"
+                },
+                \"associations\": [{
+                  \"to\": {\"id\": $TICKET_ID},
+                  \"types\": [{\"associationCategory\": \"HUBSPOT_DEFINED\", \"associationTypeId\": 9}]
+                }]
+              }" \
+              "https://api.hubapi.com/crm/v3/objects/notes" \
+              && echo "  ✅ Note added to ticket $TICKET_ID" \
+              || echo "  ⚠️  Failed to add note"
+
+            # 3c. Trigger repository_dispatch on the client repo
+            curl -sf \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "{
+                \"event_type\": \"hubspot-maintenance\",
+                \"client_payload\": {
+                  \"hubspot_ticket_id\": \"$TICKET_ID\",
+                  \"wp_install\": \"$INSTALL\",
+                  \"github_repo\": \"$REPO\",
+                  \"wp_dev_url\": \"$DEV_URL\",
+                  \"wp_staging_url\": \"$STAGING_URL\",
+                  \"wp_prod_url\": \"$PROD_URL\",
+                  \"ticket_objective\": $(echo "$OBJECTIVE" | jq -Rs .)
+                }
+              }" \
+              "https://api.github.com/repos/$GH_ORG/$REPO/dispatches" \
+              && echo "  ✅ repository_dispatch sent to $REPO" \
+              || echo "  ❌ FAILED to dispatch to $REPO"
+
+            # Rate limit: be kind to both APIs
+            sleep 2
+          done
+
+      # ── 4. Dry run output ─────────────────────────────────────────────────
+      - name: Dry run summary
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "═══════════════════════════════════════════"
+          echo "DRY RUN — no actions taken"
+          echo "Tickets that WOULD be triggered:"
+          echo "═══════════════════════════════════════════"
+          jq -r '.[] | "  • \(.id) | \(.subject) | repo=\(.github_repo) install=\(.wp_install_name)"' /tmp/tickets.json
+          echo ""
+          echo "Re-run with dry_run=false to execute"
